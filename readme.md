@@ -36,3 +36,25 @@ for arithmetic (two FLOPs per FMA).
 one callable in, one calls-per-SM-clock value out. The callable is inlined;
 its repeated outputs must remain finite. Exp2 and ALU pass their functions from
 `src/exp2.cuh` and `src/alu.cuh`. Printing happens only in `src/bench.cu`.
+
+TMEM transfers (B300):
+
+```bash
+./bazel.sh run --config=b300 --cuda_archs=sm_103a \
+  --repo_env=CUDA_PATH="$HOME/.local/micro-cuda/nvidia/cu13" \
+  //:tmem_bench
+```
+
+For B200, use `--config=b200 --cuda_archs=sm_100a`.
+Measures `32x32b.x1/x8/x16/x32` TMEM loads and stores with one warp.
+Each transfer waits for completion; each load supplies the next load's address.
+Reports median SM clocks per transfer, including wait and loop overhead.
+Allocation and value validation are outside the timing. This measures serialized
+completion cost, rather than saturated bandwidth or FA4 kernel runtime.
+
+The same executable also measures a full 128x128 FP32 tile (64 KiB) with
+four warps. Each warp transfers its 32 rows using four `x32` instructions,
+then waits once. It reports the median of 101 individual tile transfers,
+from the earliest thread timestamp to the latest completion timestamp.
+The empty timer baseline is printed separately; allocation, initialization,
+barriers and validation are outside the timed window. Softmax arithmetic is excluded.
