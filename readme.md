@@ -4,7 +4,7 @@ micro
 
 # Build
 
-Requires a host C++ compiler and a CUDA Toolkit supporting the target GPU.
+Requires Linux x86_64, a host C++ compiler, and a CUDA Toolkit supporting the target GPU.
 `bazel.sh` automatically downloads Bazelisk and the pinned Bazel version.
 
 ```bash
