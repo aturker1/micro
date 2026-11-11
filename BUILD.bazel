@@ -4,7 +4,7 @@ cuda_binary(
     name = "exp2_bench",
     srcs = ["src/bench.cu"],
     # Included by bench.cu, rather than compiled as a separate translation unit.
-    hdrs = ["src/exp2.cuh"],
+    hdrs = ["src/exp2.cuh", "src/alu.cuh"],
     copts = [
         "-O3",
         "-std=c++17",

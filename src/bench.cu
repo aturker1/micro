@@ -1,18 +1,16 @@
-// Build and run from micro/ with: make run
 #include "exp2.cuh"
-#include <algorithm>
+#include "alu.cuh"
 #include <cmath>
 #include <cstdint>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <map>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
-constexpr int kIterations = 4096;
-constexpr int kSamples = 5;
-constexpr int kWaves = 4;
+constexpr int kThreads = 512, kChains = 16;
+constexpr int kIterations = 4096, kSamples = 5, kWaves = 4;
 
 static void check(cudaError_t error) {
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
@@ -28,111 +26,103 @@ template<class T> struct DeviceBuffer {
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
 };
 
-static void benchmark() {
-    check(cudaSetDevice(0));
+template<class Op>
+static double benchmark() {
+    // Reserve enough shared memory for exactly one block per SM.
     cudaDeviceProp gpu{};
     check(cudaGetDeviceProperties(&gpu, 0));
-    if (gpu.major < 7) throw std::runtime_error("Requires compute capability >= 7.0");
-
+    const auto kernel = exp2_kernel<Op, kThreads, kChains>;
+    const size_t shared = gpu.sharedMemPerMultiprocessor / 2 + 256;
+    check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(shared)));
+    check(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    int resident = 0;
+    check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kernel, kThreads, shared));
+    if (resident != 1) throw std::runtime_error("Expected one resident block/SM");
     cudaFuncAttributes attributes{};
-    check(cudaFuncGetAttributes(&attributes, exp2_kernel));
-    if (attributes.localSizeBytes != 0)
-        throw std::runtime_error("Kernel uses local memory; inspect the ptxas spill report");
-    if (kThreads > attributes.maxThreadsPerBlock)
-        throw std::runtime_error("Block exceeds kernel thread limit");
+    check(cudaFuncGetAttributes(&attributes, kernel));
+    if (attributes.localSizeBytes) throw std::runtime_error("Kernel uses local memory");
 
-    // Reserve more than half an SM's shared memory to allow only one block/SM.
-    size_t shared_bytes = (gpu.sharedMemPerMultiprocessor / 2 / 256 + 1) * 256;
-    size_t shared_limit = gpu.sharedMemPerBlockOptin ? gpu.sharedMemPerBlockOptin
-                                                  : gpu.sharedMemPerBlock;
-    if (shared_bytes + attributes.sharedSizeBytes > shared_limit)
-        throw std::runtime_error("Not enough shared memory to isolate one block/SM");
-    check(cudaFuncSetAttribute(exp2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                               int(shared_bytes)));
-    check(cudaFuncSetAttribute(exp2_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-    int resident_blocks = 0;
-    check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &resident_blocks, exp2_kernel, kThreads, shared_bytes));
-    if (resident_blocks != 1) throw std::runtime_error("Expected one resident block/SM");
-
+    // Allocate inputs, outputs, and one timing record per block.
     const int blocks = gpu.multiProcessorCount * kWaves;
     const size_t count = size_t(blocks) * kThreads * kChains;
     std::vector<float> input(count);
     for (size_t i = 0; i < count; ++i) input[i] = 0.125f + float(i % 4096) / 8192.0f;
-    DeviceBuffer<float> device_input(count), device_output(count);
-    DeviceBuffer<BlockResult> device_results(blocks);
-    check(cudaMemcpy(device_input.data, input.data(), count * sizeof(float), cudaMemcpyHostToDevice));
+    DeviceBuffer<float> x(count), y(count);
+    DeviceBuffer<BlockResult> timings(blocks);
+    check(cudaMemcpy(x.data, input.data(), count * sizeof(float), cudaMemcpyHostToDevice));
     auto launch = [&](int iterations, int grid) {
-        exp2_kernel<<<grid, kThreads, shared_bytes>>>(
-            device_input.data, device_output.data, device_results.data, iterations, 0);
+        kernel<<<grid, kThreads, shared>>>(
+            x.data, y.data, timings.data, iterations, 0);
         check(cudaGetLastError());
         check(cudaDeviceSynchronize());
     };
 
-    // Check short recurrences before convergence hides missing iterations.
-    const int validation_blocks = std::min(blocks, 2);
-    const size_t checked = size_t(validation_blocks) * kThreads * kChains;
-    std::vector<float> actual(checked);
+    // Validate short runs before convergence can hide missing iterations.
+    std::vector<float> actual(2 * kThreads * kChains);
     for (int iterations : {0, 1, 2}) {
-        launch(iterations, validation_blocks);
-        check(cudaMemcpy(actual.data(), device_output.data, checked * sizeof(float),
-                         cudaMemcpyDeviceToHost));
-        for (size_t i = 0; i < checked; ++i) {
+        launch(iterations, 2);
+        check(cudaMemcpy(actual.data(), y.data, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < actual.size(); ++i) {
             float expected = input[i];
-            for (int j = 0; j < iterations; ++j) expected = std::exp2(-expected);
-            if (!std::isfinite(actual[i]) || std::abs(actual[i] - expected) > 2e-6f)
-                throw std::runtime_error("Numerical validation failed");
+            for (int j = 0; j < iterations; ++j) expected = Op::reference(expected);
+            if (!std::isfinite(actual[i]) || std::abs(actual[i] - expected) > Op::tolerance)
+                throw std::runtime_error(std::string(Op::name) + ": numerical validation failed");
         }
     }
-    launch(kIterations, blocks); // Warm up before collecting samples.
 
-    std::ofstream csv("exp2_samples.csv");
-    if (!csv) throw std::runtime_error("Cannot open exp2_samples.csv");
-    csv << "sample,block,sm,cycles,scalar_exp2_ops,ops_per_sm_clock\n";
-    csv << std::setprecision(12);
-    const uint64_t operations = uint64_t(kThreads) * kChains * kIterations;
+    // Warm up, then accumulate operations and cycles for each actual SM ID.
+    launch(kIterations, blocks);
+    constexpr uint64_t operations = uint64_t(kThreads) * kChains * kIterations;
     struct Totals { uint64_t operations = 0, cycles = 0; };
-    std::map<unsigned, Totals> per_sm; // SM IDs need not be contiguous.
+    std::map<unsigned, Totals> per_sm;
     std::vector<BlockResult> results(blocks);
+    Totals all;
     for (int sample = 0; sample < kSamples; ++sample) {
         launch(kIterations, blocks);
-        check(cudaMemcpy(results.data(), device_results.data, blocks * sizeof(BlockResult),
-                         cudaMemcpyDeviceToHost));
-        for (int block = 0; block < blocks; ++block) {
-            const auto& result = results[block];
-            if (!result.valid || result.cycles == 0)
-                throw std::runtime_error("Invalid timer, nonfinite recurrence, or changed SM ID");
-            auto& totals = per_sm[result.sm];
-            totals.operations += operations;
-            totals.cycles += result.cycles;
-            csv << sample << ',' << block << ',' << result.sm << ',' << result.cycles
-                << ',' << operations << ',' << double(operations) / result.cycles << '\n';
+        check(cudaMemcpy(results.data(), timings.data, blocks * sizeof(BlockResult), cudaMemcpyDeviceToHost));
+        for (const auto& result : results) {
+            if (!result.valid || !result.cycles) throw std::runtime_error("Invalid timing record");
+            auto& sm = per_sm[result.sm];
+            sm.operations += operations;
+            sm.cycles += result.cycles;
+            all.operations += operations;
+            all.cycles += result.cycles;
         }
     }
-    csv.close();
-    if (!csv) throw std::runtime_error("Failed to write samples");
 
-    std::cout << gpu.name << ": " << gpu.multiProcessorCount << " SMs\n"
+    std::cout << "== " << Op::name << '\n'
+              << gpu.name << ": " << gpu.multiProcessorCount << " SMs\n"
               << kThreads << " threads/block, " << kChains << " chains/thread, "
               << kIterations << " iterations, " << kSamples << " samples\n"
-              << attributes.numRegs << " registers/thread, " << shared_bytes << " shared bytes/block\n"
-              << "SM    exp2 ops/clock\n" << std::fixed << std::setprecision(3);
-    Totals all;
-    for (const auto& [sm, totals] : per_sm) {
+              << attributes.numRegs << " registers/thread, " << shared << " shared bytes/block\n"
+              << "SM    scalar results/clock\n" << std::fixed << std::setprecision(3);
+    for (const auto& [sm, totals] : per_sm)
         std::cout << std::setw(3) << sm << "   " << double(totals.operations) / totals.cycles << '\n';
-        all.operations += totals.operations;
-        all.cycles += totals.cycles;
-    }
-    std::cout << "Combined ops/SM clock: " << double(all.operations) / all.cycles << '\n'
-              << "Observed SMs: " << per_sm.size() << '/' << gpu.multiProcessorCount << '\n'
-              << "Raw samples: exp2_samples.csv\n";
-    if (per_sm.size() != size_t(gpu.multiProcessorCount))
-        std::cout << "NOTE: incomplete SM coverage.\n";
+    const double rate = double(all.operations) / all.cycles;
+    std::cout << "Combined results/SM clock: " << rate << '\n'
+              << "Observed SMs: " << per_sm.size() << '/' << gpu.multiProcessorCount << '\n';
+    if (per_sm.size() != size_t(gpu.multiProcessorCount)) std::cout << "NOTE: incomplete SM coverage.\n";
+    std::cout << '\n';
+    return rate;
 }
 
 int main() {
     try {
-        benchmark();
+        check(cudaSetDevice(0));
+        struct Row { const char* name; double rate; int flops; };
+        const Row rows[] = {
+            {Ex2Op::name, benchmark<Ex2Op>(), 0},
+            {AddOp::name, benchmark<AddOp>(), 1},
+            {SubOp::name, benchmark<SubOp>(), 1},
+            {MulOp::name, benchmark<MulOp>(), 1},
+            {FmaOp::name, benchmark<FmaOp>(), 2},
+        };
+        std::cout << "Summary (scalar results and FLOPs per SM clock)\n";
+        for (const auto& row : rows) {
+            std::cout << row.name << ": " << row.rate << " results";
+            if (row.flops) std::cout << ", " << row.rate * row.flops << " FLOPs";
+            std::cout << '\n';
+        }
     } catch (const std::exception& error) {
         std::cerr << "ERROR: " << error.what() << '\n';
         return 1;

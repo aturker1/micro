@@ -24,3 +24,9 @@ For the CUDA Toolkit installed on the current devbox:
 ```
 
 The executable is `bazel-bin/exp2_bench`.
+Use `./bazel.sh run` with the same flags to build and run it.
+
+It benchmarks native exp2 and FP32 add, subtract, multiply, and FMA using
+512 threads and 16 independent chains per thread.
+Output is terminal-only: scalar results per SM clock, plus FLOPs per SM clock
+for arithmetic (two FLOPs per FMA).

@@ -1,7 +1,6 @@
+#pragma once
 #include <cuda_runtime.h>
-
-constexpr int kThreads = 256;
-constexpr int kChains = 16;
+#include <cmath>
 
 struct BlockResult {
     unsigned sm;
@@ -25,16 +24,22 @@ __device__ __forceinline__ unsigned long long read_clock_after(int ready) {
     return clock;
 }
 
-// Native approximate exp2(-x). Values in [0,1] stay in [0.5,1].
-__device__ __forceinline__ float exp2_negative(float x) {
-    float result;
-    asm volatile("{ .reg .f32 negative; neg.f32 negative, %1; "
-                 "ex2.approx.ftz.f32 %0, negative; }"
-                 : "=f"(result) : "f"(x));
-    return result;
-}
+// Native MUFU.EX2.
+struct Ex2Op {
+    static constexpr const char* name = "ex2.approx";
+    static constexpr float tolerance = 2e-6f;
+    __device__ __forceinline__ static float apply(float x) {
+        float result;
+        asm volatile("{ .reg .f32 negative; neg.f32 negative, %1; "
+                     "ex2.approx.ftz.f32 %0, negative; }"
+                     : "=f"(result) : "f"(x));
+        return result;
+    }
+    static float reference(float x) { return std::exp2(-x); }
+};
 
 // Input/output layout: [block][chain][thread]. Each block writes one result.
+template<class Op, int kThreads, int kChains>
 __global__ void exp2_kernel(const float* input, float* output, BlockResult* results,
                             int iterations, unsigned clock_mask) {
     extern __shared__ unsigned long long start_clock[];
@@ -67,7 +72,7 @@ __global__ void exp2_kernel(const float* input, float* output, BlockResult* resu
     for (int iteration = 0; iteration < iterations; ++iteration) {
         #pragma unroll
         for (int chain = 0; chain < kChains; ++chain)
-            values[chain] = exp2_negative(values[chain]);
+            values[chain] = Op::apply(values[chain]);
     }
 
     sum = 0;
