@@ -1,0 +1,7 @@
+build --compilation_mode=opt
+build --flag_alias=cuda_archs=@rules_cuda//cuda:archs
+build --@rules_cuda//cuda:compiler=nvcc
+# Default to B200; use --config=b300 or --cuda_archs for another GPU.
+build --cuda_archs=sm_100
+build:b200 --cuda_archs=sm_100
+build:b300 --cuda_archs=sm_103
