@@ -1,6 +1,16 @@
 load("@rules_cuda//cuda:defs.bzl", "cuda_binary")
 
 cuda_binary(
+    name = "mma_bench",
+    srcs = ["src/mma.cu"],
+    hdrs = ["src/tmem.cuh"],
+    copts = ["-O3", "-std=c++17", "-lineinfo"],
+    host_copts = ["-std=c++17"],
+    ptxasopts = ["-v", "-warn-spills"],
+    visibility = ["//visibility:public"],
+)
+
+cuda_binary(
     name = "tmem_bench",
     srcs = ["src/tmem.cu"],
     hdrs = ["src/tmem.cuh", "src/tmem_tile.cuh"],

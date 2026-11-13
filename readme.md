@@ -1,60 +1,48 @@
 # micro
 
-micro
-
-# Build
-
-Requires Linux x86_64, a host C++ compiler, and a CUDA Toolkit supporting the target GPU.
-`bazel.sh` automatically downloads Bazelisk and the pinned Bazel version.
+Linux x86_64 and CUDA required. Build and run (B300):
 
 ```bash
-# B200 (default)
-./bazel.sh build //:exp2_bench
-
-# B300
-./bazel.sh build --config=b300 //:exp2_bench
-```
-
-For the CUDA Toolkit installed on the current devbox:
-
-```bash
-./bazel.sh build --config=b300 \
+./bazel.sh build --config=b300 --cuda_archs=sm_103a \
   --repo_env=CUDA_PATH="$HOME/.local/micro-cuda/nvidia/cu13" \
-  //:exp2_bench
+  //:exp2_bench //:tmem_bench //:mma_bench
+bazel-bin/exp2_bench
+bazel-bin/tmem_bench
+bazel-bin/mma_bench
 ```
 
-The executable is `bazel-bin/exp2_bench`.
-Use `./bazel.sh run` with the same flags to build and run it.
+Set `CUDA_PATH` to your toolkit. For B200 use `--config=b200 --cuda_archs=sm_100a`.
 
-It benchmarks native exp2 and FP32 add/subtract/multiply/FMA using
-512 threads and 16 independent chains per thread. The 4096-iteration loop is
-unrolled 8× to reduce loop-control overhead.
-Output is terminal-only: scalar results per SM clock, plus FLOPs per SM clock
-for arithmetic (two FLOPs per FMA).
+## B300 results
 
-`src/benchbed.cuh` provides `float benchbed::run(device_function)`:
-one callable in, one calls-per-SM-clock value out. The callable is inlined;
-its repeated outputs must remain finite. Exp2 and ALU pass their functions from
-`src/exp2.cuh` and `src/alu.cuh`. Printing happens only in `src/bench.cu`.
+B300 SXM6 AC, CUDA 13.2.86, 2026-11-13.
 
-TMEM transfers (B300):
+| Operation | Calls / SM clock |
+| --- | ---: |
+| Exp2 | 31.988 |
+| FP32 add | 124.106 |
+| FP32 subtract | 124.115 |
+| FP32 multiply | 124.123 |
+| FP32 FMA | 124.111 |
 
-```bash
-./bazel.sh run --config=b300 --cuda_archs=sm_103a \
-  --repo_env=CUDA_PATH="$HOME/.local/micro-cuda/nvidia/cu13" \
-  //:tmem_bench
-```
+TMEM clocks per transfer; full tile = 128×128 FP32, four warps.
 
-For B200, use `--config=b200 --cuda_archs=sm_100a`.
-Measures `32x32b.x1/x8/x16/x32` TMEM loads and stores with one warp.
-Each transfer waits for completion; each load supplies the next load's address.
-Reports median SM clocks per transfer, including wait and loop overhead.
-Allocation and value validation are outside the timing. This measures serialized
-completion cost, rather than saturated bandwidth or FA4 kernel runtime.
+| Transfer | Load | Store |
+| --- | ---: | ---: |
+| One warp, x1 | 24.03 | 12.14 |
+| One warp, x8 | 27.02 | 15.11 |
+| One warp, x16 | 31.01 | 19.08 |
+| One warp, x32 | 39.01 | 27.02 |
+| Full tile, wait each x32 | 156.00 | 113.00 |
+| Full tile, queue four x32 | 93.75 | 80.00 |
 
-The same executable also measures a full 128x128 FP32 tile (64 KiB) with
-four warps. Each warp transfers its 32 rows using four `x32` instructions,
-then waits once. It reports the median of 101 individual tile transfers,
-from the earliest thread timestamp to the latest completion timestamp.
-The empty timer baseline is printed separately; allocation, initialization,
-barriers and validation are outside the timed window. Softmax arithmetic is excluded.
+FP8 E4M3 MMA → FP32, SMEM operands; M×N×K shape, M×N output.
+
+| Shape | Wait each (clocks) | Queue all (clocks) |
+| --- | ---: | ---: |
+| 128×128×32 | 425 | 67 |
+| 128×128×128 | 582 | 256 |
+
+Wait each completes each transfer/shape; queued mode waits after the batch.
+Tile/MMA timings use 256/512-repeat slopes and include waits and loop overhead.
+All output checks passed; no spills. FMA counts as two FLOPs per call.
